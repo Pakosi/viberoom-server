@@ -28,6 +28,9 @@ const wss = new WebSocketServer({ server });
 // rooms: Map<roomId, { clients: Map<clientId, { ws, info, lastPos }> }>
 const rooms = new Map();
 
+// layouts: Map<roomId, { [objectId]: { x, y, z, rotY, scale } }>
+const layouts = new Map();
+
 function getRoom(roomId) {
   let r = rooms.get(roomId);
   if (!r) {
@@ -88,6 +91,12 @@ wss.on('connection', (ws, req) => {
       }
       ws.send(JSON.stringify({ type: 'welcome', id: clientId, room: roomId, players: others }));
 
+      // Send saved layout (if any)
+      const savedLayout = layouts.get(roomId);
+      if (savedLayout) {
+        ws.send(JSON.stringify({ type: 'layout_load', layout: savedLayout }));
+      }
+
       // Tell everyone else about new player
       broadcast(roomId, clientId, {
         type: 'peer-join',
@@ -146,6 +155,14 @@ wss.on('connection', (ws, req) => {
       case 'ping':
         ws.send(JSON.stringify({ type: 'pong' }));
         break;
+      case 'layout_save': {
+        if (msg.layout && typeof msg.layout === 'object') {
+          layouts.set(roomId, msg.layout);
+          broadcast(roomId, clientId, { type: 'layout_load', layout: msg.layout });
+          console.log(`[${roomId}] layout saved by ${info ? info.name : '?'}`);
+        }
+        break;
+      }
     }
   });
 
