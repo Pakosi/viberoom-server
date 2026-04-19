@@ -1,14 +1,14 @@
 // server.js — Vibe Room WebSocket relay server
-// Deploy on Railway / Render / Fly.io / any Node host
-// Node 18+
-
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const { randomUUID } = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const PORT = process.env.PORT || 3000;
+const DATA_FILE = path.join(__dirname, 'layouts.json');
 
-// HTTP server (health check + upgrade)
+// HTTP server
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -28,8 +28,32 @@ const wss = new WebSocketServer({ server });
 // rooms: Map<roomId, { clients: Map<clientId, { ws, info, lastPos }> }>
 const rooms = new Map();
 
-// layouts: Map<roomId, { [objectId]: { x, y, z, rotY, scale } }>
+// layouts in memory
 const layouts = new Map();
+
+function loadLayoutsFromDisk() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return;
+    const raw = fs.readFileSync(DATA_FILE, 'utf8');
+    if (!raw.trim()) return;
+    const obj = JSON.parse(raw);
+    for (const roomId of Object.keys(obj)) {
+      layouts.set(roomId, obj[roomId]);
+    }
+    console.log(`[layouts] loaded ${layouts.size} room layout(s)`);
+  } catch (err) {
+    console.error('[layouts] failed to load:', err);
+  }
+}
+
+function saveLayoutsToDisk() {
+  try {
+    const obj = Object.fromEntries(layouts);
+    fs.writeFileSync(DATA_FILE, JSON.stringify(obj, null, 2), 'utf8');
+  } catch (err) {
+    console.error('[layouts] failed to save:', err);
+  }
+}
 
 function getRoom(roomId) {
   let r = rooms.get(roomId);
@@ -57,7 +81,7 @@ function sendTo(roomId, targetId, msg) {
   if (c && c.ws.readyState === 1) c.ws.send(JSON.stringify(msg));
 }
 
-wss.on('connection', (ws, req) => {
+wss.on('connection', (ws) => {
   const clientId = randomUUID();
   let roomId = null;
   let info = null;
@@ -68,17 +92,17 @@ wss.on('connection', (ws, req) => {
     if (!msg || !msg.type) return;
 
     if (msg.type === 'join') {
-      // Leave previous room if any
       if (roomId) leaveRoom();
+
       roomId = String(msg.room || 'vibe-room').slice(0, 40);
       info = {
         name: String(msg.name || 'Player').slice(0, 20),
         preset: String(msg.preset || 'custom').slice(0, 20),
       };
+
       const r = getRoom(roomId);
       r.clients.set(clientId, { ws, info, lastPos: null });
 
-      // Send welcome with own id + list of existing players
       const others = [];
       for (const [id, c] of r.clients) {
         if (id === clientId) continue;
@@ -89,26 +113,31 @@ wss.on('connection', (ws, req) => {
           pos: c.lastPos || null,
         });
       }
-      ws.send(JSON.stringify({ type: 'welcome', id: clientId, room: roomId, players: others }));
 
-      // Send saved layout (if any)
+      ws.send(JSON.stringify({
+        type: 'welcome',
+        id: clientId,
+        room: roomId,
+        players: others,
+      }));
+
       const savedLayout = layouts.get(roomId);
       if (savedLayout) {
         ws.send(JSON.stringify({ type: 'layout_load', layout: savedLayout }));
       }
 
-      // Tell everyone else about new player
       broadcast(roomId, clientId, {
         type: 'peer-join',
         id: clientId,
         name: info.name,
         preset: info.preset,
       });
-      console.log(`[${roomId}] + ${info.name} (${clientId.slice(0,8)}) — ${r.clients.size} in room`);
+
+      console.log(`[${roomId}] + ${info.name} (${clientId.slice(0, 8)})`);
       return;
     }
 
-    if (!roomId) return; // must join first
+    if (!roomId) return;
 
     switch (msg.type) {
       case 'pos': {
@@ -119,22 +148,26 @@ wss.on('connection', (ws, req) => {
         broadcast(roomId, clientId, { type: 'pos', id: clientId, data: msg.data });
         break;
       }
+
       case 'chat':
         broadcast(roomId, clientId, { type: 'chat', id: clientId, data: msg.data });
         break;
+
       case 'draw':
         broadcast(roomId, clientId, { type: 'draw', id: clientId, data: msg.data });
         break;
+
       case 'clear':
         broadcast(roomId, clientId, { type: 'clear', id: clientId });
         break;
+
       case 'emote':
         broadcast(roomId, clientId, { type: 'emote', id: clientId, data: msg.data });
         break;
+
       case 'rtc-offer':
       case 'rtc-answer':
       case 'rtc-ice':
-        // WebRTC signaling relay — to specific peer
         if (msg.to) {
           sendTo(roomId, msg.to, {
             type: msg.type,
@@ -143,8 +176,8 @@ wss.on('connection', (ws, req) => {
           });
         }
         break;
+
       case 'rtc-request-call':
-        // Peer wants to initiate audio call with another peer
         if (msg.to) {
           sendTo(roomId, msg.to, {
             type: 'rtc-request-call',
@@ -152,13 +185,30 @@ wss.on('connection', (ws, req) => {
           });
         }
         break;
+
       case 'ping':
         ws.send(JSON.stringify({ type: 'pong' }));
         break;
+
       case 'layout_save': {
         if (msg.layout && typeof msg.layout === 'object') {
           layouts.set(roomId, msg.layout);
-          broadcast(roomId, clientId, { type: 'layout_load', layout: msg.layout });
+          saveLayoutsToDisk();
+
+          // send updated layout to everyone else
+          broadcast(roomId, clientId, {
+            type: 'layout_load',
+            layout: msg.layout,
+          });
+
+          // optional: also confirm save back to saver
+          if (ws.readyState === 1) {
+            ws.send(JSON.stringify({
+              type: 'layout_load',
+              layout: msg.layout,
+            }));
+          }
+
           console.log(`[${roomId}] layout saved by ${info ? info.name : '?'}`);
         }
         break;
@@ -170,13 +220,15 @@ wss.on('connection', (ws, req) => {
     if (!roomId) return;
     const r = rooms.get(roomId);
     if (!r) return;
+
     r.clients.delete(clientId);
+
     broadcast(roomId, clientId, {
       type: 'peer-leave',
       id: clientId,
       name: info ? info.name : 'Someone',
     });
-    console.log(`[${roomId}] - ${info ? info.name : '?'} (${clientId.slice(0,8)}) — ${r.clients.size} left`);
+
     if (r.clients.size === 0) rooms.delete(roomId);
     roomId = null;
   }
@@ -185,7 +237,6 @@ wss.on('connection', (ws, req) => {
   ws.on('error', leaveRoom);
 });
 
-// Keepalive: ping every 30s, drop dead connections
 setInterval(() => {
   wss.clients.forEach(ws => {
     if (ws.readyState === 1) {
@@ -193,6 +244,8 @@ setInterval(() => {
     }
   });
 }, 30000);
+
+loadLayoutsFromDisk();
 
 server.listen(PORT, () => {
   console.log(`Vibe Room server listening on :${PORT}`);
