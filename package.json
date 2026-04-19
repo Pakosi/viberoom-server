@@ -1,0 +1,17 @@
+{
+  "name": "vibe-room-server",
+  "version": "1.0.0",
+  "description": "WebSocket relay server for The Vibe Room multiplayer 3D space",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
