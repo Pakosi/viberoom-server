@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = process.env.PORT || 3000;
+
 const LAYOUTS_FILE = path.join(__dirname, 'layouts.json');
 const ROOM_STATE_FILE = path.join(__dirname, 'room-states.json');
 
@@ -12,7 +13,8 @@ function loadJsonSafe(file, fallback) {
   try {
     if (!fs.existsSync(file)) return fallback;
     const raw = fs.readFileSync(file, 'utf8');
-    return raw ? JSON.parse(raw) : fallback;
+    if (!raw.trim()) return fallback;
+    return JSON.parse(raw);
   } catch (err) {
     console.error(`Failed to read ${file}:`, err);
     return fallback;
@@ -32,34 +34,35 @@ const savedRoomStates = loadJsonSafe(ROOM_STATE_FILE, {});
 
 // roomId -> {
 //   clients: Set<ws>,
-//   players: Map<id, { id, name, preset, pos }>,
-//   hostState: { vibe, media, updatedAt }
+//   players: Map<id, player>,
+//   state: {
+//     vibe: 'chill',
+//     media: { videoId, playing, startAt, startedAt }
+//   }
 // }
 const rooms = new Map();
+
+function makeDefaultRoomState() {
+  return {
+    vibe: 'chill',
+    media: {
+      videoId: '',
+      playing: false,
+      startAt: 0,
+      startedAt: 0
+    }
+  };
+}
 
 function getRoom(roomId) {
   if (!rooms.has(roomId)) {
     rooms.set(roomId, {
       clients: new Set(),
       players: new Map(),
-      hostState: savedRoomStates[roomId] || {
-        vibe: 'chill',
-        media: null,
-        updatedAt: Date.now()
-      }
+      state: savedRoomStates[roomId] || makeDefaultRoomState()
     });
   }
   return rooms.get(roomId);
-}
-
-function roomSummary() {
-  let roomCount = 0;
-  let clientCount = 0;
-  for (const [, room] of rooms) {
-    roomCount++;
-    clientCount += room.clients.size;
-  }
-  return { roomCount, clientCount };
 }
 
 function send(ws, payload) {
@@ -77,20 +80,35 @@ function broadcast(room, payload, excludeWs = null) {
   }
 }
 
-function persistRoomState(roomId, room) {
-  savedRoomStates[roomId] = room.hostState;
+function persistLayout(roomId, layout) {
+  savedLayouts[roomId] = layout;
+  saveJsonSafe(LAYOUTS_FILE, savedLayouts);
+}
+
+function persistRoomState(roomId, state) {
+  savedRoomStates[roomId] = state;
   saveJsonSafe(ROOM_STATE_FILE, savedRoomStates);
+}
+
+function roomStats() {
+  let roomCount = 0;
+  let clientCount = 0;
+  for (const [, room] of rooms) {
+    roomCount += 1;
+    clientCount += room.clients.size;
+  }
+  return { roomCount, clientCount };
 }
 
 const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url === '/health') {
-    const summary = roomSummary();
+    const stats = roomStats();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ok: true,
       status: 'online',
-      rooms: summary.roomCount,
-      clients: summary.clientCount
+      rooms: stats.roomCount,
+      clients: stats.clientCount
     }));
     return;
   }
@@ -122,7 +140,7 @@ wss.on('connection', (ws) => {
 
     if (!msg || typeof msg !== 'object') return;
 
-    // JOIN
+    // ==================== JOIN ====================
     if (msg.type === 'join') {
       const roomId = String(msg.room || 'vibe-room').trim() || 'vibe-room';
       const name = String(msg.name || 'Guest').slice(0, 24);
@@ -161,8 +179,8 @@ wss.on('connection', (ws) => {
       }
 
       send(ws, {
-        type: 'host_state',
-        data: room.hostState
+        type: 'room_state',
+        data: room.state
       });
 
       broadcast(room, {
@@ -176,10 +194,9 @@ wss.on('connection', (ws) => {
     }
 
     if (!ws.roomId) return;
-
     const room = getRoom(ws.roomId);
 
-    // POS
+    // ==================== POSITION ====================
     if (msg.type === 'pos' && msg.data) {
       const player = room.players.get(ws.id);
       if (player) {
@@ -200,19 +217,19 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // CHAT
+    // ==================== CHAT ====================
     if (msg.type === 'chat' && msg.data) {
       broadcast(room, {
         type: 'chat',
         data: {
           name: String(msg.data.name || ws.playerName).slice(0, 24),
-          text: String(msg.data.text || '').slice(0, 500)
+          text: String(msg.data.text || '').slice(0, 1000)
         }
       });
       return;
     }
 
-    // WHITEBOARD DRAW
+    // ==================== WHITEBOARD ====================
     if (msg.type === 'draw' && msg.data) {
       broadcast(room, {
         type: 'draw',
@@ -221,25 +238,23 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // WHITEBOARD CLEAR
     if (msg.type === 'clear') {
-      broadcast(room, { type: 'clear' });
+      broadcast(room, { type: 'clear' }, ws);
       return;
     }
 
-    // LAYOUT SAVE
+    // ==================== LAYOUT ====================
     if (msg.type === 'layout_save' && msg.data && typeof msg.data === 'object') {
-      savedLayouts[ws.roomId] = msg.data;
-      saveJsonSafe(LAYOUTS_FILE, savedLayouts);
+      persistLayout(ws.roomId, msg.data);
 
       broadcast(room, {
         type: 'layout_load',
         data: msg.data
       });
+
       return;
     }
 
-    // LAYOUT LOAD REQUEST
     if (msg.type === 'layout_load') {
       if (savedLayouts[ws.roomId]) {
         send(ws, {
@@ -250,40 +265,33 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // HOST STATE FULL UPDATE
-    if (msg.type === 'host_state' && msg.data && typeof msg.data === 'object') {
-      room.hostState = {
-        ...room.hostState,
+    // ==================== ROOM / HOST STATE ====================
+    if (msg.type === 'room_state' && msg.data && typeof msg.data === 'object') {
+      room.state = {
+        ...makeDefaultRoomState(),
+        ...room.state,
         ...msg.data,
-        updatedAt: Date.now()
-      };
-      persistRoomState(ws.roomId, room);
-
-      broadcast(room, {
-        type: 'host_state',
-        data: room.hostState
-      });
-      return;
-    }
-
-    // HOST EVENT ONE-SHOT
-    if (msg.type === 'host_event' && msg.data && typeof msg.data === 'object') {
-      broadcast(room, {
-        type: 'host_event',
-        data: {
-          ...msg.data,
-          from: ws.playerName,
-          at: Date.now()
+        media: {
+          ...makeDefaultRoomState().media,
+          ...(room.state?.media || {}),
+          ...(msg.data.media || {})
         }
+      };
+
+      persistRoomState(ws.roomId, room.state);
+
+      broadcast(room, {
+        type: 'room_state',
+        data: room.state
       });
+
       return;
     }
 
-    // STATE GET
     if (msg.type === 'state_get') {
       send(ws, {
-        type: 'host_state',
-        data: room.hostState
+        type: 'room_state',
+        data: room.state
       });
 
       if (savedLayouts[ws.roomId]) {
@@ -292,10 +300,41 @@ wss.on('connection', (ws) => {
           data: savedLayouts[ws.roomId]
         });
       }
+
       return;
     }
 
-    // RTC PASS-THROUGH
+    // ==================== HOST EVENT ====================
+    if (msg.type === 'host_event' && msg.data && typeof msg.data === 'object') {
+      // persist room state when event includes vibe/media
+      if (msg.data.kind === 'vibe' && msg.data.mode) {
+        room.state.vibe = String(msg.data.mode);
+        persistRoomState(ws.roomId, room.state);
+      }
+
+      if (msg.data.kind === 'media') {
+        room.state.media = {
+          videoId: String(msg.data.videoId || ''),
+          playing: !!msg.data.playing,
+          startAt: Number(msg.data.startAt || 0),
+          startedAt: Number(msg.data.startedAt || 0)
+        };
+        persistRoomState(ws.roomId, room.state);
+      }
+
+      broadcast(room, {
+        type: 'host_event',
+        data: {
+          ...msg.data,
+          from: ws.playerName,
+          at: Date.now()
+        }
+      });
+
+      return;
+    }
+
+    // ==================== RTC PASS-THROUGH ====================
     if (
       msg.type === 'rtc-offer' ||
       msg.type === 'rtc-answer' ||
@@ -314,12 +353,14 @@ wss.on('connection', (ws) => {
           break;
         }
       }
+
       return;
     }
 
-    // PING
+    // ==================== PING ====================
     if (msg.type === 'ping') {
       send(ws, { type: 'pong' });
+      return;
     }
   });
 
@@ -344,7 +385,6 @@ wss.on('connection', (ws) => {
   });
 });
 
-// basic dead connection cleanup
 const interval = setInterval(() => {
   for (const client of wss.clients) {
     if (client.isAlive === false) {
