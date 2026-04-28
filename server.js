@@ -127,6 +127,8 @@ function makeBlackjackState() {
     roundId: 0,
     phaseEndsAt: 0,
     message: 'Place a play-money bet to start blackjack.',
+    visual: null,
+    visualSeq: 0,
     timer: null
   };
 }
@@ -157,6 +159,16 @@ function getBjPlayer(room, id) {
 function clearBjTimer(table) {
   if (table.timer) clearTimeout(table.timer);
   table.timer = null;
+}
+
+function setBjVisual(table, kind, data = {}) {
+  table.visualSeq = (table.visualSeq || 0) + 1;
+  table.visual = {
+    seq: table.visualSeq,
+    kind,
+    at: Date.now(),
+    ...data
+  };
 }
 
 function bjLog(room, text, extra = '') {
@@ -258,6 +270,7 @@ function repairBlackjackState(room, reason = 'unknown') {
   table.turnSeat = null;
   table.phaseEndsAt = 0;
   table.message = 'Table recovered. Place a play-money bet to start blackjack.';
+  setBjVisual(table, 'reset');
   table.seats = Array.isArray(table.seats) && table.seats.length === BJ.seatCount ? table.seats : Array.from({ length: BJ.seatCount }, () => null);
   for (let i = 0; i < table.seats.length; i++) {
     const id = table.seats[i];
@@ -358,6 +371,7 @@ function publicBlackjackState(room, viewerId = null) {
       roundId: table.roundId,
       phaseEndsAt: table.phaseEndsAt,
       message: table.message,
+      visual: table.visual,
       minBet: BJ.minBet,
       maxBet: BJ.maxBet,
       maxTransfer: BJ.maxTransfer,
@@ -400,6 +414,7 @@ function enterBetting(room) {
   table.phase = 'betting';
   table.phaseEndsAt = 0;
   table.message = 'Place a play-money bet to start blackjack.';
+  setBjVisual(table, 'betting');
   resetHandsForBetting(table);
   bjLog(room, 'betting phase open');
   broadcastBlackjack(room);
@@ -410,6 +425,7 @@ function scheduleBettingStart(room) {
   if (table.phase !== 'betting' || table.phaseEndsAt) return;
   table.phaseEndsAt = Date.now() + BJ.bettingMs;
   table.message = 'Bets are open. Round starts soon.';
+  setBjVisual(table, 'betting_timer');
   scheduleBlackjack(room, BJ.bettingMs, () => startBlackjackRound(room));
   broadcastBlackjack(room);
 }
@@ -437,6 +453,7 @@ function startBlackjackRound(room) {
   }
   bjLog(room, `round ${table.roundId} start`, `seats=${seats.map(i => i + 1).join(',')}`);
   table.message = 'Dealing cards.';
+  setBjVisual(table, 'round_start', { roundId: table.roundId });
   broadcastBlackjack(room);
   dealInitialBlackjackCards(room, seats, 0);
 }
@@ -450,20 +467,24 @@ function dealInitialBlackjackCards(room, seats, step) {
     if (p) {
       p.hand.push(drawCard(table));
       table.message = `Dealing first card to ${p.name}.`;
+      setBjVisual(table, 'deal_player', { seat: seats[step], playerId: p.id, cardIndex: p.hand.length - 1 });
     }
   } else if (step === seats.length) {
     table.dealer.hand.push(drawCard(table));
     table.message = 'Dealer shows one card.';
+    setBjVisual(table, 'deal_dealer_up', { cardIndex: table.dealer.hand.length - 1 });
   } else if (step < seats.length * 2 + 1) {
     const seatIdx = seats[step - seats.length - 1];
     const p = table.players[table.seats[seatIdx]];
     if (p) {
       p.hand.push(drawCard(table));
       table.message = `Dealing second card to ${p.name}.`;
+      setBjVisual(table, 'deal_player', { seat: seatIdx, playerId: p.id, cardIndex: p.hand.length - 1 });
     }
   } else if (step === seats.length * 2 + 1) {
     table.dealer.hand.push(drawCard(table));
     table.message = 'Dealer takes the hole card.';
+    setBjVisual(table, 'deal_dealer_hole', { cardIndex: table.dealer.hand.length - 1 });
   }
   broadcastBlackjack(room);
 
@@ -483,6 +504,7 @@ function dealInitialBlackjackCards(room, seats, step) {
     }
     table.phase = 'player_turn';
     table.message = 'Cards dealt. Player decisions begin.';
+    setBjVisual(table, 'decision_start');
     advanceBlackjackTurn(room);
   });
 }
@@ -499,6 +521,7 @@ function advanceBlackjackTurn(room) {
       table.phase = 'player_turn';
       table.phaseEndsAt = Date.now() + BJ.turnMs;
       table.message = `${p.name}'s turn.`;
+      setBjVisual(table, 'turn', { seat, playerId: p.id });
       bjLog(room, 'turn', `seat=${seat + 1} player=${p.name}`);
       scheduleBlackjack(room, BJ.turnMs, () => {
         const current = table.players[table.seats[seat]];
@@ -524,6 +547,7 @@ function finishPlayersAndResolve(room) {
   table.phaseEndsAt = 0;
   table.dealer.reveal = true;
   table.message = 'Dealer reveals the hole card.';
+  setBjVisual(table, 'dealer_reveal');
   broadcastBlackjack(room);
   scheduleBlackjack(room, BJ.dealerStepMs, () => dealerDrawStep(room));
 }
@@ -534,11 +558,13 @@ function dealerDrawStep(room) {
   if (handValue(table.dealer.hand) < 17) {
     table.dealer.hand.push(drawCard(table));
     table.message = `Dealer hits to ${handLabel(table.dealer.hand)}.`;
+    setBjVisual(table, 'dealer_hit', { cardIndex: table.dealer.hand.length - 1 });
     broadcastBlackjack(room);
     scheduleBlackjack(room, BJ.dealerStepMs, () => dealerDrawStep(room));
     return;
   }
   table.message = `Dealer stands on ${handLabel(table.dealer.hand)}.`;
+  setBjVisual(table, 'dealer_stand');
   broadcastBlackjack(room);
   scheduleBlackjack(room, BJ.dealerStepMs, () => resolveBlackjackRound(room));
 }
@@ -575,6 +601,7 @@ function resolveBlackjackRound(room) {
   table.phase = 'results';
   table.phaseEndsAt = Date.now() + BJ.resultsMs;
   table.message = 'Round complete. Results paid in play-money chips.';
+  setBjVisual(table, 'results');
   bjLog(room, `round ${table.roundId} end`, `dealer=${dealerTotal}${dealerBust ? ' bust' : ''}`);
   broadcastBlackjack(room);
   scheduleBlackjack(room, BJ.resultsMs, () => enterBetting(room));
@@ -606,6 +633,7 @@ function handleBlackjackMessage(room, ws, msg) {
     p.seat = seat;
     table.seats[seat] = ws.id;
     table.message = `${p.name} sat at seat ${seat + 1}.`;
+    setBjVisual(table, 'sit', { seat, playerId: p.id });
     broadcastBlackjack(room);
     return true;
   }
@@ -621,6 +649,7 @@ function handleBlackjackMessage(room, ws, msg) {
     p.hand = [];
     p.result = '';
     table.message = `${p.name} left the blackjack table.`;
+    setBjVisual(table, 'leave', { playerId: p.id });
     broadcastBlackjack(room);
     return true;
   }
@@ -634,6 +663,7 @@ function handleBlackjackMessage(room, ws, msg) {
       p.bank = Math.max(0, p.bank);
       p.wallet = Math.max(0, p.wallet);
       table.message = `${p.name} withdrew ${moved} play chips.`;
+      setBjVisual(table, 'withdraw', { playerId: p.id, amount: moved });
       bjLog(room, 'withdraw', `player=${p.name} amount=${moved}`);
     } else {
       const moved = Math.min(amount, p.wallet);
@@ -642,6 +672,7 @@ function handleBlackjackMessage(room, ws, msg) {
       p.bank = Math.max(0, p.bank);
       p.wallet = Math.max(0, p.wallet);
       table.message = `${p.name} deposited ${moved} play chips.`;
+      setBjVisual(table, 'deposit', { playerId: p.id, amount: moved });
       bjLog(room, 'deposit', `player=${p.name} amount=${moved}`);
     }
     broadcastBlackjack(room);
@@ -661,6 +692,7 @@ function handleBlackjackMessage(room, ws, msg) {
     p.bet = amount;
     p.wallet = Math.max(0, p.wallet - amount);
     p.result = 'Bet locked';
+    setBjVisual(table, 'bet', { seat: p.seat, playerId: p.id, amount });
     bjLog(room, 'bet', `player=${p.name} seat=${p.seat + 1} amount=${amount}`);
     scheduleBettingStart(room);
     broadcastBlackjack(room);
@@ -673,6 +705,7 @@ function handleBlackjackMessage(room, ws, msg) {
     }
     if (msg.type === 'blackjack_hit') {
       p.hand.push(drawCard(table));
+      setBjVisual(table, 'hit', { seat: p.seat, playerId: p.id, cardIndex: p.hand.length - 1 });
       bjLog(room, 'hit', `player=${p.name} total=${handLabel(p.hand)}`);
       if (handValue(p.hand) > 21) {
         p.busted = true;
@@ -695,6 +728,7 @@ function handleBlackjackMessage(room, ws, msg) {
     if (msg.type === 'blackjack_stand') {
       p.stood = true;
       p.result = 'Stand';
+      setBjVisual(table, 'stand', { seat: p.seat, playerId: p.id });
       bjLog(room, 'stand', `player=${p.name} total=${handLabel(p.hand)}`);
       advanceBlackjackTurn(room);
       return true;
@@ -708,6 +742,7 @@ function handleBlackjackMessage(room, ws, msg) {
       p.bet *= 2;
       p.doubled = true;
       p.hand.push(drawCard(table));
+      setBjVisual(table, 'double', { seat: p.seat, playerId: p.id, cardIndex: p.hand.length - 1, bet: p.bet });
       bjLog(room, 'double', `player=${p.name} bet=${p.bet} total=${handLabel(p.hand)}`);
       if (handValue(p.hand) > 21) {
         p.busted = true;
