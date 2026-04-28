@@ -38,9 +38,9 @@ const BJ = {
   minBet: 25,
   maxBet: 500,
   maxTransfer: 1000,
-  bettingMs: 12000,
-  turnMs: 20000,
-  resultsMs: 7000,
+  bettingMs: 8000,
+  turnMs: 10000,
+  resultsMs: 3000,
   decks: 4
 };
 
@@ -157,6 +157,11 @@ function clearBjTimer(table) {
   table.timer = null;
 }
 
+function bjLog(room, text, extra = '') {
+  const roomLabel = room && [...rooms.entries()].find(([, r]) => r === room)?.[0] || 'room';
+  console.log(`[blackjack:${roomLabel}] ${text}${extra ? ' ' + extra : ''}`);
+}
+
 function sanitizeAmount(value) {
   const amount = Math.floor(Number(value));
   if (!Number.isFinite(amount)) return 0;
@@ -203,6 +208,12 @@ function isBlackjack(hand) {
   return hand.length === 2 && handValue(hand) === 21;
 }
 
+function handLabel(hand) {
+  const total = handValue(hand);
+  const soft = hand.some(card => card.rank === 'A') && hand.reduce((sum, card) => sum + cardValue(card.rank), 0) <= 21;
+  return soft && total <= 21 ? `soft ${total}` : String(total);
+}
+
 function drawCard(table) {
   if (table.shoe.length < 26) table.shoe = makeShoe();
   return table.shoe.pop();
@@ -219,8 +230,96 @@ function activeBetSeats(table) {
   return out;
 }
 
+function roomHasClient(room, id) {
+  for (const client of room.clients) if (client.id === id && client.readyState === 1) return true;
+  return false;
+}
+
+function clearStaleBlackjackSeats(room) {
+  const table = room.blackjack;
+  for (let i = 0; i < table.seats.length; i++) {
+    const id = table.seats[i];
+    if (!id) continue;
+    if (!room.players.has(id) || !roomHasClient(room, id) || !table.players[id]) {
+      table.seats[i] = null;
+      if (table.players[id]) table.players[id].seat = null;
+    }
+  }
+}
+
+function repairBlackjackState(room, reason = 'unknown') {
+  const table = room.blackjack;
+  bjLog(room, `state reset: ${reason}`);
+  clearBjTimer(table);
+  table.phase = 'betting';
+  table.dealer = { hand: [], reveal: false };
+  table.turnSeat = null;
+  table.phaseEndsAt = 0;
+  table.message = 'Table recovered. Place a play-money bet to start blackjack.';
+  table.seats = Array.isArray(table.seats) && table.seats.length === BJ.seatCount ? table.seats : Array.from({ length: BJ.seatCount }, () => null);
+  for (let i = 0; i < table.seats.length; i++) {
+    const id = table.seats[i];
+    if (!id || !room.players.has(id) || !table.players[id]) {
+      table.seats[i] = null;
+      continue;
+    }
+    const p = table.players[id];
+    p.seat = i;
+    p.bank = Math.max(0, Math.floor(Number(p.bank) || 0));
+    p.wallet = Math.max(0, Math.floor(Number(p.wallet) || 0));
+    p.bet = 0;
+    p.hand = [];
+    p.stood = false;
+    p.busted = false;
+    p.doubled = false;
+    p.result = '';
+  }
+  for (const [id, p] of Object.entries(table.players)) {
+    if (!room.players.has(id)) {
+      delete table.players[id];
+      continue;
+    }
+    p.bank = Math.max(0, Math.floor(Number(p.bank) || 0));
+    p.wallet = Math.max(0, Math.floor(Number(p.wallet) || 0));
+    if (p.seat === null || table.seats[p.seat] !== id) p.seat = null;
+  }
+  broadcastBlackjack(room);
+}
+
+function validateBlackjackState(room) {
+  const table = room.blackjack;
+  if (!table || !Array.isArray(table.seats) || table.seats.length !== BJ.seatCount) return false;
+  if (!['betting', 'dealing', 'player_turn', 'dealer_turn', 'results'].includes(table.phase)) return false;
+  for (let i = 0; i < table.seats.length; i++) {
+    const id = table.seats[i];
+    if (!id) continue;
+    const p = table.players[id];
+    if (!p || !room.players.has(id) || p.seat !== i) return false;
+    if (p.bank < 0 || p.wallet < 0 || p.bet < 0) return false;
+  }
+  if (table.phase === 'player_turn') {
+    if (table.turnSeat === null || !table.seats[table.turnSeat]) return false;
+    const p = table.players[table.seats[table.turnSeat]];
+    if (!p || !p.bet || p.stood || p.busted) return false;
+  }
+  return true;
+}
+
+function guardedBlackjack(room, label, fn) {
+  try {
+    const out = fn();
+    if (!validateBlackjackState(room)) repairBlackjackState(room, `invalid after ${label}`);
+    return out;
+  } catch (err) {
+    console.error(`[blackjack] ${label} failed:`, err);
+    repairBlackjackState(room, label);
+    return undefined;
+  }
+}
+
 function publicBlackjackState(room, viewerId = null) {
   const table = room.blackjack;
+  clearStaleBlackjackSeats(room);
   const players = {};
   for (const [id, p] of Object.entries(table.players)) {
     players[id] = {
@@ -232,6 +331,7 @@ function publicBlackjackState(room, viewerId = null) {
       bet: p.bet,
       hand: p.hand,
       total: p.hand.length ? handValue(p.hand) : 0,
+      totalLabel: p.hand.length ? handLabel(p.hand) : '',
       stood: p.stood,
       busted: p.busted,
       doubled: p.doubled,
@@ -249,7 +349,8 @@ function publicBlackjackState(room, viewerId = null) {
       players,
       dealer: {
         hand: dealerHand,
-        total: table.dealer.reveal ? handValue(table.dealer.hand) : (table.dealer.hand[0] ? handValue([table.dealer.hand[0]]) : 0)
+        total: table.dealer.reveal ? handValue(table.dealer.hand) : (table.dealer.hand[0] ? handValue([table.dealer.hand[0]]) : 0),
+        totalLabel: table.dealer.reveal ? handLabel(table.dealer.hand) : (table.dealer.hand[0] ? handLabel([table.dealer.hand[0]]) : '')
       },
       turnSeat: table.turnSeat,
       roundId: table.roundId,
@@ -274,7 +375,7 @@ function scheduleBlackjack(room, ms, fn) {
   clearBjTimer(table);
   table.timer = setTimeout(() => {
     table.timer = null;
-    fn();
+    guardedBlackjack(room, 'timer', fn);
   }, ms);
 }
 
@@ -298,6 +399,7 @@ function enterBetting(room) {
   table.phaseEndsAt = 0;
   table.message = 'Place a play-money bet to start blackjack.';
   resetHandsForBetting(table);
+  bjLog(room, 'betting phase open');
   broadcastBlackjack(room);
 }
 
@@ -336,6 +438,7 @@ function startBlackjackRound(room) {
     table.dealer.hand.push(drawCard(table));
   }
   table.message = 'Cards dealt.';
+  bjLog(room, `round ${table.roundId} start`, `seats=${seats.map(i => i + 1).join(',')}`);
   broadcastBlackjack(room);
 
   if (isBlackjack(table.dealer.hand) || seats.every(i => isBlackjack(table.players[table.seats[i]].hand))) {
@@ -358,11 +461,13 @@ function advanceBlackjackTurn(room) {
       table.phase = 'player_turn';
       table.phaseEndsAt = Date.now() + BJ.turnMs;
       table.message = `${p.name}'s turn.`;
+      bjLog(room, 'turn', `seat=${seat + 1} player=${p.name}`);
       scheduleBlackjack(room, BJ.turnMs, () => {
         const current = table.players[table.seats[seat]];
         if (table.phase === 'player_turn' && table.turnSeat === seat && current) {
           current.stood = true;
           current.result = 'Auto-stand';
+          bjLog(room, 'timeout auto-stand', `seat=${seat + 1} player=${current.name}`);
           advanceBlackjackTurn(room);
         }
       });
@@ -380,6 +485,8 @@ function finishPlayersAndResolve(room) {
   table.turnSeat = null;
   table.phaseEndsAt = 0;
   table.dealer.reveal = true;
+  table.message = 'Dealer reveals and plays.';
+  broadcastBlackjack(room);
   while (handValue(table.dealer.hand) < 17) table.dealer.hand.push(drawCard(table));
   resolveBlackjackRound(room);
 }
@@ -395,26 +502,28 @@ function resolveBlackjackRound(room) {
     const bj = isBlackjack(p.hand);
     let payout = 0;
     if (p.busted || total > 21) {
-      p.result = 'Bust';
+      p.result = 'BUST';
     } else if (bj && !dealerBj) {
       payout = p.bet + Math.floor(p.bet * 1.5);
-      p.result = 'Blackjack pays 3:2';
+      p.result = 'BLACKJACK';
     } else if (dealerBj && !bj) {
-      p.result = 'Dealer blackjack';
+      p.result = 'LOSE';
     } else if (dealerBust || total > dealerTotal) {
       payout = p.bet * 2;
-      p.result = 'Win';
+      p.result = 'YOU WIN';
     } else if (total === dealerTotal) {
       payout = p.bet;
-      p.result = 'Push';
+      p.result = 'PUSH';
     } else {
-      p.result = 'Loss';
+      p.result = 'LOSE';
     }
-    p.wallet += payout;
+    p.wallet = Math.max(0, p.wallet + payout);
+    bjLog(room, 'payout', `player=${p.name} bet=${p.bet} payout=${payout} result=${p.result}`);
   }
   table.phase = 'results';
   table.phaseEndsAt = Date.now() + BJ.resultsMs;
   table.message = 'Round complete. Results paid in play-money chips.';
+  bjLog(room, `round ${table.roundId} end`, `dealer=${dealerTotal}${dealerBust ? ' bust' : ''}`);
   broadcastBlackjack(room);
   scheduleBlackjack(room, BJ.resultsMs, () => enterBetting(room));
 }
@@ -427,9 +536,18 @@ function handleBlackjackMessage(room, ws, msg) {
     return true;
   }
   if (msg.type === 'blackjack_sit') {
+    clearStaleBlackjackSeats(room);
     const seat = Math.floor(Number(msg.seat));
-    if (seat < 0 || seat >= BJ.seatCount || table.seats[seat]) {
+    if (seat < 0 || seat >= BJ.seatCount || (table.seats[seat] && table.seats[seat] !== ws.id)) {
       send(ws, { type: 'blackjack_error', error: 'Seat is not available.' });
+      return true;
+    }
+    if (table.phase !== 'betting' && p.bet > 0) {
+      send(ws, { type: 'blackjack_error', error: 'Change seats between rounds.' });
+      return true;
+    }
+    if (p.seat === seat && table.seats[seat] === ws.id) {
+      send(ws, publicBlackjackState(room, ws.id));
       return true;
     }
     if (p.seat !== null && table.seats[p.seat] === ws.id) table.seats[p.seat] = null;
@@ -461,12 +579,18 @@ function handleBlackjackMessage(room, ws, msg) {
       const moved = Math.min(amount, p.bank);
       p.bank -= moved;
       p.wallet += moved;
+      p.bank = Math.max(0, p.bank);
+      p.wallet = Math.max(0, p.wallet);
       table.message = `${p.name} withdrew ${moved} play chips.`;
+      bjLog(room, 'withdraw', `player=${p.name} amount=${moved}`);
     } else {
       const moved = Math.min(amount, p.wallet);
       p.wallet -= moved;
       p.bank += moved;
+      p.bank = Math.max(0, p.bank);
+      p.wallet = Math.max(0, p.wallet);
       table.message = `${p.name} deposited ${moved} play chips.`;
+      bjLog(room, 'deposit', `player=${p.name} amount=${moved}`);
     }
     broadcastBlackjack(room);
     return true;
@@ -477,14 +601,15 @@ function handleBlackjackMessage(room, ws, msg) {
       return true;
     }
     const amount = sanitizeAmount(msg.amount);
-    if (amount < BJ.minBet || amount > BJ.maxBet || amount > p.wallet) {
+    if (amount < BJ.minBet || amount > BJ.maxBet || amount > p.wallet || p.wallet <= 0) {
       send(ws, { type: 'blackjack_error', error: 'Invalid bet or not enough wallet chips.' });
       return true;
     }
     if (p.bet > 0) p.wallet += p.bet;
     p.bet = amount;
-    p.wallet -= amount;
+    p.wallet = Math.max(0, p.wallet - amount);
     p.result = 'Bet locked';
+    bjLog(room, 'bet', `player=${p.name} seat=${p.seat + 1} amount=${amount}`);
     scheduleBettingStart(room);
     broadcastBlackjack(room);
     return true;
@@ -496,9 +621,10 @@ function handleBlackjackMessage(room, ws, msg) {
     }
     if (msg.type === 'blackjack_hit') {
       p.hand.push(drawCard(table));
+      bjLog(room, 'hit', `player=${p.name} total=${handLabel(p.hand)}`);
       if (handValue(p.hand) > 21) {
         p.busted = true;
-        p.result = 'Bust';
+        p.result = 'BUST';
         advanceBlackjackTurn(room);
       } else {
         table.phaseEndsAt = Date.now() + BJ.turnMs;
@@ -517,21 +643,23 @@ function handleBlackjackMessage(room, ws, msg) {
     if (msg.type === 'blackjack_stand') {
       p.stood = true;
       p.result = 'Stand';
+      bjLog(room, 'stand', `player=${p.name} total=${handLabel(p.hand)}`);
       advanceBlackjackTurn(room);
       return true;
     }
     if (msg.type === 'blackjack_double') {
-      if (p.hand.length !== 2 || p.wallet < p.bet) {
+      if (p.hand.length !== 2 || p.bet <= 0 || p.wallet < p.bet) {
         send(ws, { type: 'blackjack_error', error: 'Double down requires two cards and enough wallet chips.' });
         return true;
       }
-      p.wallet -= p.bet;
+      p.wallet = Math.max(0, p.wallet - p.bet);
       p.bet *= 2;
       p.doubled = true;
       p.hand.push(drawCard(table));
+      bjLog(room, 'double', `player=${p.name} bet=${p.bet} total=${handLabel(p.hand)}`);
       if (handValue(p.hand) > 21) {
         p.busted = true;
-        p.result = 'Double bust';
+        p.result = 'BUST';
       } else {
         p.stood = true;
         p.result = 'Double stand';
@@ -547,6 +675,11 @@ function cleanupBlackjackPlayer(room, id) {
   const table = room.blackjack;
   const p = table.players[id];
   if (!p) return;
+  if (table.phase === 'player_turn' && p.seat === table.turnSeat && p.bet > 0) {
+    p.stood = true;
+    p.result = 'Auto-stand disconnect';
+    bjLog(room, 'disconnect auto-stand', `player=${p.name}`);
+  }
   if (p.seat !== null && table.seats[p.seat] === id) table.seats[p.seat] = null;
   delete table.players[id];
   if (table.turnSeat !== null && table.seats[table.turnSeat] === null) advanceBlackjackTurn(room);
@@ -662,7 +795,7 @@ wss.on('connection', (ws) => {
       msg.type === 'safe_withdraw' ||
       msg.type === 'safe_deposit'
     ) {
-      if (handleBlackjackMessage(room, ws, msg)) return;
+      if (guardedBlackjack(room, msg.type, () => handleBlackjackMessage(room, ws, msg))) return;
     }
 
     // ==================== POSITION ====================
