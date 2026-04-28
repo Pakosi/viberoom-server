@@ -41,6 +41,8 @@ const BJ = {
   bettingMs: 8000,
   turnMs: 10000,
   resultsMs: 3000,
+  dealStepMs: 520,
+  dealerStepMs: 650,
   decks: 4
 };
 
@@ -433,20 +435,56 @@ function startBlackjackRound(room) {
     p.doubled = false;
     p.result = '';
   }
-  for (let pass = 0; pass < 2; pass++) {
-    for (const i of seats) table.players[table.seats[i]].hand.push(drawCard(table));
-    table.dealer.hand.push(drawCard(table));
-  }
-  table.message = 'Cards dealt.';
   bjLog(room, `round ${table.roundId} start`, `seats=${seats.map(i => i + 1).join(',')}`);
+  table.message = 'Dealing cards.';
+  broadcastBlackjack(room);
+  dealInitialBlackjackCards(room, seats, 0);
+}
+
+function dealInitialBlackjackCards(room, seats, step) {
+  const table = room.blackjack;
+  if (table.phase !== 'dealing') return;
+  const totalSteps = seats.length * 2 + 2;
+  if (step < seats.length) {
+    const p = table.players[table.seats[seats[step]]];
+    if (p) {
+      p.hand.push(drawCard(table));
+      table.message = `Dealing first card to ${p.name}.`;
+    }
+  } else if (step === seats.length) {
+    table.dealer.hand.push(drawCard(table));
+    table.message = 'Dealer shows one card.';
+  } else if (step < seats.length * 2 + 1) {
+    const seatIdx = seats[step - seats.length - 1];
+    const p = table.players[table.seats[seatIdx]];
+    if (p) {
+      p.hand.push(drawCard(table));
+      table.message = `Dealing second card to ${p.name}.`;
+    }
+  } else if (step === seats.length * 2 + 1) {
+    table.dealer.hand.push(drawCard(table));
+    table.message = 'Dealer takes the hole card.';
+  }
   broadcastBlackjack(room);
 
-  if (isBlackjack(table.dealer.hand) || seats.every(i => isBlackjack(table.players[table.seats[i]].hand))) {
-    finishPlayersAndResolve(room);
+  if (step + 1 < totalSteps) {
+    scheduleBlackjack(room, BJ.dealStepMs, () => dealInitialBlackjackCards(room, seats, step + 1));
     return;
   }
-  table.phase = 'player_turn';
-  advanceBlackjackTurn(room);
+  scheduleBlackjack(room, BJ.dealStepMs, () => {
+    const liveSeats = seats.filter(i => table.seats[i] && table.players[table.seats[i]] && table.players[table.seats[i]].bet > 0);
+    if (!liveSeats.length) {
+      enterBetting(room);
+      return;
+    }
+    if (isBlackjack(table.dealer.hand) || liveSeats.every(i => isBlackjack(table.players[table.seats[i]].hand))) {
+      finishPlayersAndResolve(room);
+      return;
+    }
+    table.phase = 'player_turn';
+    table.message = 'Cards dealt. Player decisions begin.';
+    advanceBlackjackTurn(room);
+  });
 }
 
 function advanceBlackjackTurn(room) {
@@ -485,10 +523,24 @@ function finishPlayersAndResolve(room) {
   table.turnSeat = null;
   table.phaseEndsAt = 0;
   table.dealer.reveal = true;
-  table.message = 'Dealer reveals and plays.';
+  table.message = 'Dealer reveals the hole card.';
   broadcastBlackjack(room);
-  while (handValue(table.dealer.hand) < 17) table.dealer.hand.push(drawCard(table));
-  resolveBlackjackRound(room);
+  scheduleBlackjack(room, BJ.dealerStepMs, () => dealerDrawStep(room));
+}
+
+function dealerDrawStep(room) {
+  const table = room.blackjack;
+  if (table.phase !== 'dealer_turn') return;
+  if (handValue(table.dealer.hand) < 17) {
+    table.dealer.hand.push(drawCard(table));
+    table.message = `Dealer hits to ${handLabel(table.dealer.hand)}.`;
+    broadcastBlackjack(room);
+    scheduleBlackjack(room, BJ.dealerStepMs, () => dealerDrawStep(room));
+    return;
+  }
+  table.message = `Dealer stands on ${handLabel(table.dealer.hand)}.`;
+  broadcastBlackjack(room);
+  scheduleBlackjack(room, BJ.dealerStepMs, () => resolveBlackjackRound(room));
 }
 
 function resolveBlackjackRound(room) {
